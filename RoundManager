@@ -1,0 +1,534 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
+
+local PlayerDataStore = DataStoreService:GetDataStore("PlayerData_v1")
+
+local function getEvent(name)
+	local ev = ReplicatedStorage:FindFirstChild(name)
+	if not ev then
+		ev = Instance.new("RemoteEvent")
+		ev.Name = name
+		ev.Parent = ReplicatedStorage
+	end
+	return ev
+end
+
+local function getBindable(name)
+	local ev = ReplicatedStorage:FindFirstChild(name)
+	if not ev then
+		ev = Instance.new("BindableEvent")
+		ev.Name = name
+		ev.Parent = ReplicatedStorage
+	end
+	return ev
+end
+
+local function getBindableFunction(name)
+	local fn = ReplicatedStorage:FindFirstChild(name)
+	if not fn then
+		fn = Instance.new("BindableFunction")
+		fn.Name = name
+		fn.Parent = ReplicatedStorage
+	end
+	return fn
+end
+
+local RoundEvent = getEvent("RoundEvent")
+local MapSpinEvent = getEvent("MapSpinEvent")
+local CountdownEvent = getEvent("CountdownEvent")
+local ScoreboardEvent = getEvent("ScoreboardEvent")
+local DeployRequest = getEvent("DeployRequest")
+local CelebrateEvent = getEvent("CelebrateEvent")
+local GamemodeSpinEvent = getEvent("GamemodeSpinEvent")
+
+local GamemodeRoundEvent = getBindable("GamemodeRoundEvent")
+local FinishScoreModifier = getBindableFunction("FinishScoreModifier")
+
+local SpawnsFolder = workspace:WaitForChild("RoundSpawns")
+local EndPartsFolder = workspace:WaitForChild("EndParts")
+local LobbySpawn = workspace:WaitForChild("LobbySpawn")
+
+local Maps = {
+	{ name = "SpaceStation", spawn = "Spawn6" },
+	{ name = "Classic", spawn = "Spawn2" },
+	{ name = "Upper jungle", spawn = "Spawn3" },
+	{ name = "Collapsing area", spawn = "Spawn4" },
+	{ name = "Volcano tower", spawn = "Spawn5" },
+	{ name = "Snowland", spawn = "Spawn1" },
+	{ name = "Food land", spawn = "Spawn7" }
+}
+
+local Gamemodes = {
+	"Normal",
+	"Bomb",
+	"Delivery"
+}
+
+local MIN_PLAYERS = 1
+local START_DELAY = 333333333333333
+local ROUND_TIME = 7 * 60
+local END_COOLDOWN = 2.5
+
+local lastMapIndex = nil
+local roundActive = false
+local currentSpawn = nil
+local chosenGamemode = "Normal"
+
+local roundScores = {}
+local deployed = {}
+local endCooldown = {}
+local PlayerData = {}
+
+local function xpNeeded(level)
+	return math.floor(100 * (1.1 ^ (level - 1)))
+end
+
+local function xpReward(place)
+	if place == 1 then return 175 end
+	if place == 2 then return 100 end
+	if place == 3 then return 50 end
+	return 25
+end
+
+local function baseReward(place)
+	if place == 1 then return 200 end
+	if place == 2 then return 123 end
+	if place == 3 then return 75 end
+	if place == 4 then return 50 end
+	return 15
+end
+
+local function multiplier()
+	local count = #Players:GetPlayers()
+	return 1 + math.max(0, count - 1) * 0.5
+end
+
+Players.PlayerAdded:Connect(function(player)
+	player:SetAttribute("IsDeployed", false)
+
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	leaderstats.Parent = player
+
+	local cash = Instance.new("IntValue")
+	cash.Name = "Cash"
+	cash.Parent = leaderstats
+
+	local wins = Instance.new("IntValue")
+	wins.Name = "Wins"
+	wins.Parent = leaderstats
+
+	local level = Instance.new("IntValue")
+	level.Name = "Level"
+	level.Parent = leaderstats
+
+	local xp = Instance.new("IntValue")
+	xp.Name = "XP"
+	xp.Parent = player
+
+	local data
+	local success, result = pcall(function()
+		return PlayerDataStore:GetAsync(player.UserId)
+	end)
+
+	if success and result then
+		data = result
+	else
+		data = {
+			Cash = 0,
+			Wins = 0,
+			Level = 1,
+			XP = 0
+		}
+	end
+
+	PlayerData[player] = data
+
+	cash.Value = data.Cash or 0
+	wins.Value = data.Wins or 0
+	level.Value = data.Level or 1
+	xp.Value = data.XP or 0
+
+	roundScores[player.UserId] = 0
+	deployed[player.UserId] = false
+end)
+
+local function savePlayer(player)
+	local data = PlayerData[player]
+	if not data then return end
+
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local xp = player:FindFirstChild("XP")
+
+	if leaderstats and xp then
+		local cash = leaderstats:FindFirstChild("Cash")
+		local wins = leaderstats:FindFirstChild("Wins")
+		local level = leaderstats:FindFirstChild("Level")
+
+		if cash and wins and level then
+			data.Cash = cash.Value
+			data.Wins = wins.Value
+			data.Level = level.Value
+			data.XP = xp.Value
+
+			pcall(function()
+				PlayerDataStore:SetAsync(player.UserId, data)
+			end)
+		end
+	end
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	savePlayer(player)
+
+	PlayerData[player] = nil
+	roundScores[player.UserId] = nil
+	deployed[player.UserId] = nil
+	endCooldown[player.UserId] = nil
+end)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		savePlayer(player)
+	end
+end)
+
+local function chooseMap()
+	local index
+	repeat
+		index = math.random(1, #Maps)
+	until index ~= lastMapIndex
+
+	lastMapIndex = index
+	return Maps[index]
+end
+
+local function chooseGamemode()
+	return Gamemodes[math.random(1, #Gamemodes)]
+end
+
+local function teleportPlayer(player, part)
+	local character = player.Character
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+	if hrp then
+		hrp.Anchored = false
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+		hrp.CFrame = part.CFrame + Vector3.new(0, 5, 0)
+	end
+
+	if humanoid then
+		humanoid.PlatformStand = false
+		humanoid.WalkSpeed = 30
+		humanoid.JumpPower = 50
+		humanoid.AutoRotate = true
+	end
+end
+
+local function teleportAllToLobby()
+	for _, player in ipairs(Players:GetPlayers()) do
+		player:SetAttribute("IsDeployed", false)
+		deployed[player.UserId] = false
+		teleportPlayer(player, LobbySpawn)
+	end
+end
+
+local function resetRoundStats()
+	roundScores = {}
+	deployed = {}
+	endCooldown = {}
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		roundScores[player.UserId] = 0
+		deployed[player.UserId] = false
+		player:SetAttribute("IsDeployed", false)
+	end
+end
+
+local function getSortedScores()
+	local list = {}
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		table.insert(list, {
+			UserId = player.UserId,
+			Name = player.Name,
+			DisplayName = player.DisplayName,
+			Score = roundScores[player.UserId] or 0
+		})
+	end
+
+	table.sort(list, function(a, b)
+		if a.Score == b.Score then
+			return a.Name < b.Name
+		end
+		return a.Score > b.Score
+	end)
+
+	return list
+end
+
+local function clearCrowns()
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		if character then
+			local crown = character:FindFirstChild("FirstPlaceCrown")
+			if crown then
+				crown:Destroy()
+			end
+		end
+	end
+end
+
+local function giveCrownToLeader()
+	clearCrowns()
+
+	local sorted = getSortedScores()
+	local leaderData = sorted[1]
+
+	if not leaderData or leaderData.Score <= 0 then return end
+
+	local leader = Players:GetPlayerByUserId(leaderData.UserId)
+	if not leader then return end
+
+	local character = leader.Character
+	local head = character and character:FindFirstChild("Head")
+	if not head then return end
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "FirstPlaceCrown"
+	billboard.Size = UDim2.new(0, 90, 0, 70)
+	billboard.StudsOffset = Vector3.new(0, 2.7, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = head
+	billboard.Parent = character
+
+	local crown = Instance.new("TextLabel")
+	crown.Size = UDim2.new(1, 0, 1, 0)
+	crown.BackgroundTransparency = 1
+	crown.Text = "👑"
+	crown.TextScaled = true
+	crown.Font = Enum.Font.GothamBlack
+	crown.TextColor3 = Color3.fromRGB(255, 220, 60)
+	crown.Parent = billboard
+end
+
+local function broadcastScoreboard()
+	local sorted = getSortedScores()
+	ScoreboardEvent:FireAllClients("UPDATE", sorted)
+	giveCrownToLeader()
+end
+
+DeployRequest.OnServerEvent:Connect(function(player)
+	if not roundActive then return end
+	if not currentSpawn then return end
+
+	local character = player.Character
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local lobby = workspace:FindFirstChild("Lobby")
+	if not lobby or not lobby:IsA("BasePart") then
+		warn("Lobby mora biti Part u Workspace.")
+		return
+	end
+
+	local p = hrp.Position
+	local lp = lobby.CFrame:PointToObjectSpace(p)
+	local half = lobby.Size / 2
+
+	local insideLobby =
+		math.abs(lp.X) <= half.X and
+		math.abs(lp.Y) <= half.Y and
+		math.abs(lp.Z) <= half.Z
+
+	if not insideLobby then
+		return
+	end
+
+	deployed[player.UserId] = true
+	player:SetAttribute("IsDeployed", true)
+
+	teleportPlayer(player, currentSpawn)
+
+	ScoreboardEvent:FireClient(player, "DEPLOYED")
+	broadcastScoreboard()
+end)
+local function getFinishScore(player)
+	local scoreAmount = 1
+
+	if chosenGamemode == "Delivery" then
+		local success, result = pcall(function()
+			return FinishScoreModifier:Invoke(player)
+		end)
+
+		if success and typeof(result) == "number" and result > 0 then
+			scoreAmount = result
+		end
+	end
+
+	return scoreAmount
+end
+
+local function hookEndPart(part)
+	if not part:IsA("BasePart") then return end
+
+	part.Touched:Connect(function(hit)
+		if not roundActive then return end
+
+		local character = hit.Parent
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local player = humanoid and Players:GetPlayerFromCharacter(character)
+
+		if not player then return end
+		if player:GetAttribute("IsDeployed") ~= true then return end
+		if not deployed[player.UserId] then return end
+		if endCooldown[player.UserId] then return end
+
+		endCooldown[player.UserId] = true
+
+		local scoreAmount = getFinishScore(player)
+		roundScores[player.UserId] = (roundScores[player.UserId] or 0) + scoreAmount
+
+		broadcastScoreboard()
+		ScoreboardEvent:FireClient(player, "FINISH_SCORED", roundScores[player.UserId])
+		ScoreboardEvent:FireClient(player, "GOAL_SCORED", roundScores[player.UserId])
+
+		task.delay(0.35, function()
+			if roundActive and currentSpawn and player.Parent then
+				teleportPlayer(player, currentSpawn)
+			end
+		end)
+
+		task.delay(END_COOLDOWN, function()
+			endCooldown[player.UserId] = nil
+		end)
+	end)
+end
+
+for _, part in ipairs(EndPartsFolder:GetChildren()) do
+	hookEndPart(part)
+end
+
+EndPartsFolder.ChildAdded:Connect(function(part)
+	task.wait(0.1)
+	hookEndPart(part)
+end)
+
+local function giveRoundRewards()
+	local sorted = getSortedScores()
+
+	for place, entry in ipairs(sorted) do
+		if entry.Score > 0 then
+			local player = Players:GetPlayerByUserId(entry.UserId)
+
+			if player then
+				local leaderstats = player:FindFirstChild("leaderstats")
+				local xp = player:FindFirstChild("XP")
+
+				if leaderstats and xp then
+					local cash = leaderstats:FindFirstChild("Cash")
+					local wins = leaderstats:FindFirstChild("Wins")
+					local level = leaderstats:FindFirstChild("Level")
+
+					if cash then
+						cash.Value += math.floor(baseReward(place) * multiplier())
+					end
+
+					if wins and place == 1 then
+						wins.Value += 1
+					end
+
+					if level then
+						xp.Value += xpReward(place)
+
+						while xp.Value >= xpNeeded(level.Value) do
+							xp.Value -= xpNeeded(level.Value)
+							level.Value += 1
+						end
+					end
+				end
+
+				if place <= 3 then
+					CelebrateEvent:FireClient(player, place)
+				end
+			end
+		end
+	end
+
+	return sorted
+end
+
+while true do
+	while #Players:GetPlayers() < MIN_PLAYERS do
+		RoundEvent:FireAllClients("WAITING")
+		task.wait(1)
+	end
+
+	resetRoundStats()
+	clearCrowns()
+	ScoreboardEvent:FireAllClients("HIDE")
+
+	for i = START_DELAY, 1, -1 do
+		RoundEvent:FireAllClients("STARTING", i)
+		task.wait(1)
+	end
+
+	GamemodeSpinEvent:FireAllClients("START_SPIN", Gamemodes)
+	task.wait(5)
+
+	chosenGamemode = chooseGamemode()
+
+	GamemodeSpinEvent:FireAllClients("STOP_SPIN", chosenGamemode)
+	task.wait(1)
+
+	local map = chooseMap()
+
+	MapSpinEvent:FireAllClients("START_SPIN", Maps)
+	task.wait(5)
+
+	MapSpinEvent:FireAllClients("STOP_SPIN", map.name)
+	task.wait(1)
+
+	currentSpawn = SpawnsFolder:WaitForChild(map.spawn)
+
+	for _, value in ipairs({ "3", "2", "1", "GO!" }) do
+		CountdownEvent:FireAllClients(value)
+		task.wait(1)
+	end
+
+	roundActive = true
+
+	GamemodeRoundEvent:Fire("ROUND_STARTED", chosenGamemode, ROUND_TIME)
+	RoundEvent:FireAllClients("ROUND_STARTED", chosenGamemode, map.name)
+	ScoreboardEvent:FireAllClients("SHOW", getSortedScores())
+
+	for t = ROUND_TIME, 0, -1 do
+		RoundEvent:FireAllClients("TIME", t)
+		task.wait(1)
+	end
+
+	roundActive = false
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		player:SetAttribute("IsDeployed", false)
+		deployed[player.UserId] = false
+	end
+
+	local finalResults = giveRoundRewards()
+
+	GamemodeRoundEvent:Fire("ROUND_ENDED", chosenGamemode, ROUND_TIME)
+	RoundEvent:FireAllClients("ROUND_ENDED")
+	ScoreboardEvent:FireAllClients("FINAL", finalResults)
+
+	task.wait(7)
+
+	clearCrowns()
+	ScoreboardEvent:FireAllClients("HIDE")
+	teleportAllToLobby()
+	resetRoundStats()
+
+	task.wait(2)
+end
