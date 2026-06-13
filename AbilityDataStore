@@ -1,0 +1,91 @@
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local AbilityStore = DataStoreService:GetDataStore("PlayerAbility_v1")
+
+local SetAbilityEvent = ReplicatedStorage:FindFirstChild("SetAbilityEvent")
+if not SetAbilityEvent then
+	SetAbilityEvent = Instance.new("RemoteEvent")
+	SetAbilityEvent.Name = "SetAbilityEvent"
+	SetAbilityEvent.Parent = ReplicatedStorage
+end
+
+local UpdateAbilityUIEvent = ReplicatedStorage:FindFirstChild("UpdateAbilityUIEvent")
+if not UpdateAbilityUIEvent then
+	UpdateAbilityUIEvent = Instance.new("RemoteEvent")
+	UpdateAbilityUIEvent.Name = "UpdateAbilityUIEvent"
+	UpdateAbilityUIEvent.Parent = ReplicatedStorage
+end
+
+local validAbilities = {
+	["NONE"] = true,
+	["DASH STACKER"] = true,
+	["STICKY TRAIL"] = true,
+	["FREEZER"] = true,
+	["LIFE STEALER"] = true,
+	["RECHARGE"] = true,
+	["REAPER"] = true,
+	["BUILDERMAN"] = true,
+	["GET OUT OF MY WAY"] = true,
+}
+
+local currentAbility = {}
+
+local function applyAbility(player, abilityName, save)
+	if not validAbilities[abilityName] then
+		abilityName = "NONE"
+	end
+
+	currentAbility[player] = abilityName
+	player:SetAttribute("CurrentAbility", abilityName)
+	UpdateAbilityUIEvent:FireClient(player, abilityName)
+
+	if save then
+		pcall(function()
+			AbilityStore:SetAsync(player.UserId, abilityName)
+		end)
+	end
+end
+
+Players.PlayerAdded:Connect(function(player)
+	local ability = "NONE"
+
+	local success, result = pcall(function()
+		return AbilityStore:GetAsync(player.UserId)
+	end)
+
+	if success and result and validAbilities[result] then
+		ability = result
+	end
+
+	applyAbility(player, ability, false)
+end)
+
+SetAbilityEvent.OnServerEvent:Connect(function(player, abilityName)
+	if not validAbilities[abilityName] then return end
+	applyAbility(player, abilityName, true)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	local ability = currentAbility[player]
+
+	if ability then
+		pcall(function()
+			AbilityStore:SetAsync(player.UserId, ability)
+		end)
+	end
+
+	currentAbility[player] = nil
+end)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		local ability = currentAbility[player]
+		if ability then
+			pcall(function()
+				AbilityStore:SetAsync(player.UserId, ability)
+			end)
+		end
+	end
+end)
